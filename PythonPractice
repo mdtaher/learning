@@ -1,0 +1,155 @@
+import json
+import boto3
+import datetime
+import csv
+import os
+import hmac
+import hashlib
+import base64
+from io import StringIO
+import pandas as pd   #Have to add as a library to work in AWS currently giving issues
+
+c3_list = []
+client = boto3.client('s3')
+s3 = boto3.resource('s3')
+
+def create_hash(column, secret_bytes):
+    data_bytes = column.encode('latin-1')
+    digest = hmac.new(secret_bytes, msg=data_bytes, digestmod=hashlib.sha256).digest()
+    signature = base64.b64encode(digest).decode()
+    return signature
+
+#def lambda_handler(event, context):
+def lambda_handler():
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    file_key = event['Records'][0]['s3']['object']['key']
+    global client
+    obj = getPath(bucket_name, file_key)
+    dir_path = obj['directory_path']
+    obj_name = obj['object_name']
+    c3_list = obj['c3_list']
+    c3_content = obj['c3_content']
+    dir_path_anonymize = obj['directory_path_anonymize']
+    obj_uploaded = s3.Object(bucket_name, file_key)
+    csv_obj = client.get_object(Bucket=bucket_name, Key=file_key)
+    # If bucket tag value is set as Anonymize = YES then call anonymize fucntion
+    if dir_path_anonymize:
+        anony = anonymize(bucket_name, file_key, obj_name, dir_path_anonymize)
+    if c3_content == 'YES':
+        obj_uploaded.metadata.update({'c3-content':c3_content})
+    parquet_file_name = obj_name+".parquet"
+    key = dir_path+"/"+parquet_file_name
+
+    #Process csv object uploaded 
+
+    body = csv_obj['Body']
+    csv_string = body.read().decode('utf-8')
+    # read csv object 
+    df = pd.read_csv(StringIO(csv_string))
+    #convert dataframe to parquet format
+    df.to_parquet(parquet_file_name)
+    copy_source = {'Bucket': bucket_name,'Key': parquet_file_name }
+    #df.to_parquet file will not save in to S3, have to upload local file to s3
+    s3.Bucket(bucket_name).upload_file(parquet_file_name, parquet_file_name)
+    s3.Object(bucket_name, key).copy_from(CopySource=copy_source, Metadata=obj_uploaded.metadata, MetadataDirective='REPLACE')
+    #delete uploaded file from actual location as it has moved to desired location
+    s3.Object(bucket_name, file_key).delete()
+    s3.Object(bucket_name, parquet_file_name).delete()
+    #remove converted parquet file which has saved in local
+    os.remove(parquet_file_name)
+    return {
+        'statusCode': 200,
+        'body': "Saved file succesfully"
+    }
+
+def anonymize(bucket_name, file_key, obj_name, dir_path_anonymize):
+    ENCODING = "utf-8"
+    secret = "vodaAnonymize"
+    secret_bytes = bytes(secret, 'latin-1')
+    s3.Bucket(bucket_name).download_file(file_key, file_key)
+    out_file = obj_name+".csv"
+    parquet_anonymize_file =  obj_name +".parquet"
+    key_anonymize = dir_path_anonymize+"/"+parquet_anonymize_file
+    with open(file_key, 'rt', encoding=ENCODING, newline='') as in_file, open(out_file, 'wt', encoding=ENCODING, newline='') as out_file_name:
+        reader = csv.DictReader(in_file)
+        writer = csv.DictWriter(out_file_name, reader.fieldnames)
+        writer.writeheader()
+        for row in reader:
+            for column in c3_list:
+                row[column] = create_hash(row[column], secret_bytes)
+            writer.writerow(row)
+    copy_source = {'Bucket': bucket_name,'Key': parquet_anonymize_file}
+    df = pd.read_csv(out_file)
+    df.to_parquet(parquet_anonymize_file)
+    s3.Bucket(bucket_name).upload_file(parquet_anonymize_file, parquet_anonymize_file)
+    s3.Object(bucket_name, key_anonymize).copy_from(CopySource=copy_source)
+    #delete uploaded file from actual location as it has moved to desired location
+    s3.Object(bucket_name, parquet_anonymize_file).delete()
+    #remove converted parquet file which has saved in local
+    print(parquet_anonymize_file)
+    os.remove(parquet_anonymize_file)
+    os.remove(out_file)
+    os.remove(file_key)
+    return out_file
+
+def getPath(bucket_name, file_key):
+    #default values for variables
+    archive = ""
+    anonymize = ""
+    directory_path = ""
+    directory_path_anonymize = ""
+    object_name = ""
+    c3_content = "NO"
+    global c3_list
+    global client
+    #Creating Timestamp
+    now = datetime.datetime.now()
+    datetime_str = datetime.datetime.strftime(now,"%Y%m%d%H.%M.%S.%f")
+    #Get Tags data and check anonymize is yes or no
+    bucketTags = getBucketTags(bucket_name)
+    for tag in bucketTags:
+        if tag['Key']=='anonymization':
+            if tag['Value'] == 'yes':
+                anonymize='anonymized'
+    #Read Lookup file
+    lookup_file_key = 'lookupFile_csv_v02.json'
+    obj = client.get_object(Bucket=bucket_name, Key=lookup_file_key)
+    data = json.loads(obj['Body'].read())
+    #Read functional group info
+    tableName = file_key.split('.')[0]
+    for p in data:
+        if p['table_name'] == tableName:
+            if p['c3'].strip() == 'YES':
+                c3_list_with_spaces = p['c3_fields'].split(",")
+                c3_content = p['c3']
+                c3_list = [field.strip() for field in c3_list_with_spaces]
+            if p['functional_group']:
+                print('inside functional group')
+                functionalGroup = p['functional_group'].replace(" ","_").lower()
+                #check functional group has Archive data or not
+                if 'ARCHIVE' in p['table_name'].strip():
+                    archive = "archive"
+                directory_path = os.path.join(p['feed'],archive,functionalGroup,p["table_name"],str(now.year),str(now.month),str(now.day)).replace("\\","/")
+                object_name = tableName+"_"+p['source_system']+"_"+datetime_str
+                if anonymize:
+                    directory_path_anonymize = os.path.join(anonymize,p['feed'],archive,functionalGroup,p["table_name"],str(now.year),str(now.month),str(now.day)).replace("\\","/")
+            else:
+                directory_path = os.path.join('misc',p["table_name"],str(now.year),str(now.month),str(now.day)).replace("\\","/")
+                object_name = tableName+"_"+p['source_system']+"_"+datetime_str
+                if anonymize:
+                    directory_path_anonymize = os.path.join(anonymize,'misc',p["table_name"],str(now.year),str(now.month),str(now.day)).replace("\\","/")
+
+    return {
+        'c3_content': c3_content,
+        'c3_list':c3_list,
+        'object_name': object_name,
+        'directory_path': directory_path,
+        'directory_path_anonymize' : directory_path_anonymize
+    }
+    return path
+
+def getBucketTags(bucketName):
+    global client
+    response = client.get_bucket_tagging(Bucket=bucketName)
+    bucketTags = response['TagSet']
+    return bucketTags
